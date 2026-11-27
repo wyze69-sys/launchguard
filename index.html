@@ -1,0 +1,572 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- CSP (round 2): scripts only from this origin, the two hashed inline
+     scripts below (LG-B6 detector + the module), and the pinned unpkg
+     origin that serves web3.js for the wallet path. No objects, no base
+     override. connect-src allows arbitrary https RPC endpoints plus
+     localhost http for local dev endpoints. style-src keeps the inline
+     <style> block working. Hashes must be recomputed if either inline
+     script changes. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' https://unpkg.com 'sha256-lNgU3lPhtY+e637QJLfZvRpPY2ec36bIJfEfjuZYE2c=' 'sha256-uIwrrlYnkNrrEqqbCiOWEJ2NaIAeelnVGV2VbGN+StM='; style-src 'unsafe-inline'; img-src data:; object-src 'none'; base-uri 'none'; connect-src https: http://localhost:* http://127.0.0.1:*">
+<title>LaunchGuard — Solana token risk reports you can verify</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; background: #0e0e12; color: #f2f2f5; }
+  main { max-width: 680px; margin: 0 auto; padding: 32px 20px 64px; }
+  h1 { font-size: 30px; margin: 0 0 6px; } p.sub { color: #a7a7b3; margin: 0 0 24px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; } input { flex: 1; min-width: 220px; padding: 12px; border-radius: 10px; border: 1px solid #33333d; background: #17171d; color: #fff; }
+  select, button { padding: 12px 14px; border-radius: 10px; border: 0; }
+  button { background: #9945ff; color: #fff; font-weight: 700; cursor: pointer; }
+  button.secondary { background: #23232c; border: 1px solid #33333d; font-weight: 600; }
+  button:disabled { opacity: .5; cursor: wait; } #out { margin-top: 24px; }
+  .samples { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+  .muted { color: #a7a7b3; font-size: 13px; }
+  .score { font-size: 52px; font-weight: 800; } .score small { font-size: 20px; }
+  .flag { background: #17171d; border: 1px solid #2b2b35; border-radius: 10px; padding: 10px 14px; margin: 8px 0; }
+  .sev-high { border-left: 5px solid #ff5252; } .sev-medium { border-left: 5px solid #ffb020; } .sev-low { border-left: 5px solid #6b6b7a; }
+  .err { color: #ff8080; } code, pre { word-break: break-all; white-space: pre-wrap; }
+  .panel { background: #17171d; border: 1px solid #2b2b35; border-radius: 10px; padding: 14px 16px; margin: 16px 0; }
+  .panel h3 { margin: 0 0 8px; font-size: 16px; }
+  table.facts { border-collapse: collapse; width: 100%; font-size: 14px; }
+  table.facts td { padding: 5px 8px; border-bottom: 1px solid #2b2b35; }
+  table.facts td:first-child { color: #a7a7b3; width: 45%; }
+  textarea { width: 100%; box-sizing: border-box; padding: 12px; border-radius: 10px; border: 1px solid #33333d; background: #17171d; color: #fff; font-family: inherit; margin-bottom: 10px; }
+  a { color: #b388ff; }
+</style>
+</head>
+<body>
+<main>
+  <h1>LaunchGuard</h1>
+  <p class="sub">Paste a Solana token mint. Get a risk report you can verify.</p>
+  <p class="muted">A "mint" is a token's unique address on Solana — paste that address, not a wallet address. The score runs 0 to 100: higher means riskier. The cluster selector picks the network the mint is looked up on (most real tokens are on mainnet-beta).</p>
+  <div class="row">
+    <input id="mint" placeholder="Token mint address, e.g. EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v">
+    <select id="cluster"><option>mainnet-beta</option><option>devnet</option></select>
+    <button id="go">Score it</button>
+  </div>
+  <div class="samples">
+    <button type="button" class="secondary" id="sample-ruggy">Sample: ruggy token (offline demo data)</button>
+    <button type="button" class="secondary" id="sample-usdc">Sample: USDC (clean — live network call)</button>
+  </div>
+  <div id="env-warning" class="panel" style="display:none;border-color:#ff5252">
+    <h3>This page must be served over HTTP</h3>
+    <p id="env-warning-text">LaunchGuard is built from ES modules, which browsers refuse to load from a file:// page, so the buttons above cannot work when the file is opened directly. Serve this folder instead, for example <code>python3 -m http.server 8000</code> or <code>npx serve .</code>, then open the http://localhost address it prints.</p>
+  </div>
+  <p class="muted" id="rpc-line"></p>
+  <div id="out"></div>
+
+  <div class="panel">
+    <h3>Verify a report</h3>
+    <p class="muted">Paste a report JSON (from a report's "Copy report JSON" button) or a memo text
+      carrying an <code>h=</code> digest. Report JSON is verified by recomputing its SHA-256 digest
+      from the canonical form; memo text is compared against the digest of the report currently
+      shown above, and its mint/score/band fields are cross-checked against that report.
+      One outcome to know in advance: FIELD MISMATCH means the memo's digest matches the displayed
+      report but its printed mint/score/band fields disagree with it — in plain words, the memo text
+      and the report do not describe the same result, so do not trust that memo for this report.</p>
+    <textarea id="verify-input" rows="5" placeholder="Paste report JSON or memo text here"></textarea>
+    <div class="row"><button type="button" class="secondary" id="verify-btn">Verify</button></div>
+    <p id="verify-result"></p>
+  </div>
+
+  <p class="muted">LaunchGuard is an informational screening tool, not financial advice.</p>
+</main>
+
+<!--
+  OPTIONAL: use your own keyed RPC endpoint (recommended for demos — the
+  public endpoints rate-limit). Get a free Helius endpoint at
+  https://dashboard.helius.dev, then UNCOMMENT the script below and paste
+  your URL over the placeholder. Never commit a real API key.
+  If you paste a real key here, this file contains your key in plain
+  text — do not commit or share this file with a real key in it; use a
+  dedicated, restricted Helius key, not a production trading key.
+
+<script>
+  window.LAUNCHGUARD_CONFIG = {
+    rpcEndpoints: {
+      "mainnet-beta": "https://mainnet.helius-rpc.com/?api-key=YOUR_KEY",
+      // devnet: "https://devnet.helius-rpc.com/?api-key=YOUR_KEY",
+    },
+  };
+</script>
+-->
+
+<script>
+  // LG-B6: detect file:// (or a module that never loads) and warn in-page
+  // instead of leaving silently dead buttons.
+  window.__lgModuleLoaded = false;
+  (function () {
+    function showWarning() {
+      var w = document.getElementById("env-warning");
+      if (w) w.style.display = "block";
+    }
+    if (window.location.protocol === "file:") {
+      if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", showWarning);
+      else showWarning();
+    } else {
+      setTimeout(function () { if (!window.__lgModuleLoaded) showWarning(); }, 4000);
+    }
+  })();
+</script>
+<script type="module">
+  import { fetchMintFacts } from "./src/lib/solana.js";
+  import { scoreMint, summarize } from "./src/lib/risk.js";
+  import { buildReportMemo, anchorReportDemoMode, submitMemoWithWallet, explorerUrlForSignature } from "./src/lib/memo.js";
+  import { buildReport, digestReport, verifyReport, parseMemoDigest, parseMemoFields, compareMemoFieldsToReport } from "./src/lib/report.js";
+  import { getRpcEndpointHost } from "./src/lib/config.js";
+  window.__lgModuleLoaded = true;
+
+  // The currently displayed report and its digest, for the verifier below.
+  // Cleared on every error path (see clearCurrentReport) so the verifier
+  // can never match a memo against a stale report that is no longer shown.
+  let currentReport = null;
+  let currentDigest = null;
+  let currentReportOffline = false;
+  function clearCurrentReport() {
+    currentReport = null;
+    currentDigest = null;
+    currentReportOffline = false;
+  }
+
+  const out = document.getElementById("out");
+  const mintInput = document.getElementById("mint");
+  const clusterSelect = document.getElementById("cluster");
+  const goButton = document.getElementById("go");
+  const rpcLine = document.getElementById("rpc-line");
+
+  // --- DOM helpers: every dynamic value goes through textContent and DOM
+  // --- APIs only (no HTML string interpolation), so on-chain data and
+  // --- error text can never inject markup into the page.
+  function el(tag, className, text) {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+  function clearOut() { while (out.firstChild) out.removeChild(out.firstChild); }
+  function showError(message) {
+    // Every error path (invalid address, RPC failure, mint-not-found)
+    // funnels through here: the previously displayed report is gone from
+    // the page, so its digest must stop being verifiable against memos.
+    clearCurrentReport();
+    clearOut();
+    out.appendChild(el("p", "err", message));
+  }
+
+  function updateRpcLine() {
+    try {
+      rpcLine.textContent = `RPC endpoint in use: ${getRpcEndpointHost(clusterSelect.value)} (host only shown; add a Helius key in the LAUNCHGUARD_CONFIG snippet in this file to use your own)`;
+    } catch {
+      rpcLine.textContent = "";
+    }
+  }
+  clusterSelect.addEventListener("change", updateRpcLine);
+  updateRpcLine();
+
+  // Base58 alphabet (no 0, O, I, l), Solana addresses are 32-44 chars.
+  const BASE58_ADDRESS_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+  function isValidMintAddress(value) { return BASE58_ADDRESS_RE.test(value); }
+
+  function fmtPct(v) { return typeof v === "number" ? `${v.toFixed(1)}%` : "unknown"; }
+  function fmtBool(v) { return v === true ? "ACTIVE" : v === false ? "none (revoked)" : "unknown"; }
+
+  const TOKEN_PROGRAM_ID_UI = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+  const TOKEN_2022_PROGRAM_ID_UI = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+  function fmtProgram(facts) {
+    if (facts.programId === TOKEN_2022_PROGRAM_ID_UI) return "Token-2022";
+    if (facts.programId === TOKEN_PROGRAM_ID_UI) return "Token (classic)";
+    return facts.programId ?? "unknown";
+  }
+  function fmtExtensions(facts) {
+    const ext = facts.extensions;
+    if (ext === null || ext === undefined) return "unknown (could not be read)";
+    const active = [];
+    if (ext.hasPermanentDelegate) active.push("permanent delegate");
+    if (ext.hasTransferFee) active.push(typeof ext.effectiveFeeBasisPoints === "number" ? `transfer fee ${(ext.effectiveFeeBasisPoints / 100).toFixed(2)}%` : "transfer fee");
+    if (ext.nonTransferable) active.push("non-transferable");
+    if (ext.defaultFrozen) active.push("default frozen");
+    if (ext.hasTransferHook) active.push("transfer hook");
+    if (ext.hasConfidentialTransfer) active.push("confidential transfers");
+    if (ext.hasMintCloseAuthority) active.push("mint close authority (fact only, not scored)");
+    if (ext.hasPausableConfig) active.push(ext.transfersPaused ? "pausable — TRANSFERS CURRENTLY PAUSED" : "pausable (can be paused by an authority; not paused now — fact only, not scored)");
+    if (ext.hasScaledUiAmount) active.push("scaled UI amount (displayed balances are scaled by an authority-set multiplier — fact only, never scored)");
+    if (Array.isArray(ext.unknownExtensions) && ext.unknownExtensions.length) active.push(`unrecognised extension(s): ${ext.unknownExtensions.join(", ")} (coverage incomplete)`);
+    return active.length ? active.join(", ") : "none";
+  }
+  function fmtTrapFacts(facts) {
+    const ext = facts.extensions;
+    if (ext === null || ext === undefined) return "unknown (could not be read)";
+    const parts = [];
+    parts.push(`transfer-fee config authority: ${ext.transferFeeConfigAuthority ? "ACTIVE" : "none"}`);
+    parts.push(`withdraw withheld authority: ${ext.withdrawWithheldAuthority ? "ACTIVE" : "none"}`);
+    parts.push(`transfer hook authority: ${ext.transferHookProgramId ? (ext.transferHookAuthority ? "ACTIVE" : "none") : "no hook"}`);
+    parts.push(`transfer fee cap (maximum fee): ${ext.transferFeeMaximumFee ?? "none set"}`);
+    return parts.join("; ");
+  }
+  function fmtLiquidity(facts) {
+    const liq = facts.liquidity;
+    if (!liq) return "unknown";
+    if (liq.status === "detected") {
+      let text = `detected — pool found on a checked venue (${liq.poolCount} pool${liq.poolCount === 1 ? "" : "s"})`;
+      if (liq.venues) {
+        const names = { raydiumAmmV4: "Raydium AMM v4", meteoraDlmm: "Meteora DLMM", meteoraDammV2: "Meteora DAMM v2", meteoraDammV1: "Meteora DAMM v1", orcaWhirlpool: "Orca Whirlpool" };
+        const parts = Object.entries(liq.venues).filter(([, n]) => n > 0).map(([k, n]) => `${names[k] || k}: ${n}`);
+        if (parts.length) text += ` — ${parts.join(", ")}`;
+      }
+      return text;
+    }
+    if (liq.status === "not-detected") return "not detected (no pool found on Raydium AMM v4, Meteora DLMM, Meteora DAMM v2, Meteora DAMM v1 or Orca Whirlpool)";
+    return "unknown (the check did not produce a result)";
+  }
+
+  async function renderReport({ mintLabel, facts, result, offline, cluster }) {
+    clearOut();
+    const color = result.score >= 60 ? "#ff5252" : result.score >= 30 ? "#ffb020" : "#3ddc84";
+    const scoreDiv = el("div", "score");
+    scoreDiv.style.color = color;
+    scoreDiv.appendChild(document.createTextNode(String(result.score)));
+    scoreDiv.appendChild(el("small", null, `/100 — ${result.band}`));
+    out.appendChild(scoreDiv);
+
+    if (offline) {
+      out.appendChild(el("p", "muted",
+        "OFFLINE DEMO DATA: this report was scored from built-in sample facts, not from the chain. " +
+        "No RPC call was made and there is no real mint behind it. Score a real mint to see live data."));
+    } else {
+      const p = el("p", "muted", `Mint: ${mintLabel} · cluster: ${cluster ?? clusterSelect.value}`);
+      out.appendChild(p);
+    }
+
+    if (result.flags.length) {
+      for (const f of result.flags) {
+        const flag = el("div", `flag sev-${f.severity}`);
+        flag.appendChild(el("b", null, `${f.key} (+${f.points})`));
+        flag.appendChild(document.createElement("br"));
+        flag.appendChild(document.createTextNode(f.detail));
+        out.appendChild(flag);
+      }
+    } else {
+      out.appendChild(el("p", null, "No major flags found."));
+    }
+
+    // Facts table — exactly what the score was computed from.
+    const factsPanel = el("div", "panel");
+    factsPanel.appendChild(el("h3", null, "Facts used for this score"));
+    const table = el("table", "facts");
+    const rows = [
+      ["Mint authority", fmtBool(facts.mintAuthorityActive)],
+      ["Freeze authority", fmtBool(facts.freezeAuthorityActive)],
+      ["Largest token account", fmtPct(facts.topHolderPct)],
+      ["Top 10 token accounts", fmtPct(facts.top10HolderPct)],
+      ["Top 20 token accounts (display only, not scored)", fmtPct(facts.top20HolderPct)],
+      ["Slot the mint was read at", facts.slot === null || facts.slot === undefined ? "unknown" : String(facts.slot)],
+      ["Token accounts (floor*)", facts.holderCount === null || facts.holderCount === undefined ? "unknown" : facts.holderCountIsFloor ? `≥${facts.holderCount} (floor — the returned count; the exact count needs an indexer)` : String(facts.holderCount)],
+      ["Total supply (UI units)", facts.supplyUi === null || facts.supplyUi === undefined ? "unknown" : facts.supplyUi.toLocaleString("en-US")],
+      ["Token program", fmtProgram(facts)],
+      ["Token-2022 extensions", fmtExtensions(facts)],
+      ["Dormant-trap facts (authorities & fee cap)", fmtTrapFacts(facts)],
+      ["Liquidity", fmtLiquidity(facts)],
+      ["LP burn / lock", facts.liquidity ? String(facts.liquidity.lpStatus) : "not-checked"],
+    ];
+    for (const [label, value] of rows) {
+      const tr = document.createElement("tr");
+      tr.appendChild(el("td", null, label));
+      tr.appendChild(el("td", null, value));
+      table.appendChild(tr);
+    }
+    factsPanel.appendChild(table);
+    factsPanel.appendChild(el("p", "muted",
+      "* Token-account count is a floor from the largest-accounts RPC call, not a full indexer count, and token accounts are not the same as owners: one owner can hold many accounts. See README honest limits."));
+    out.appendChild(factsPanel);
+
+    // Canonical verifiable report + digest (report.js). The digest covers
+    // the facts (at 6-decimal precision), score, band, flag keys and
+    // confidence — change any of them and the digest changes. Flag detail
+    // text is not part of the report and is not digest-bound.
+    const report = buildReport({
+      mint: mintLabel,
+      cluster: cluster ?? clusterSelect.value,
+      facts,
+      result,
+      observedAt: new Date(),
+    });
+    let digest = null;
+    try {
+      digest = await digestReport(report);
+    } catch {
+      digest = null; // WebCrypto unavailable (non-secure context): report still renders.
+    }
+    currentReport = report;
+    currentDigest = digest;
+    currentReportOffline = Boolean(offline);
+
+    // Checked-vs-Not-Checked receipt (report.coverage): what this scan
+    // did and did not check, in plain language, right under the score.
+    if (report.coverage) {
+      const receiptPanel = el("div", "panel");
+      receiptPanel.appendChild(el("h3", null, "What was checked — and what was not"));
+      receiptPanel.appendChild(el("p", "muted", "Checked:"));
+      for (const item of report.coverage.checked) receiptPanel.appendChild(el("p", "muted", `✓ ${item}`));
+      receiptPanel.appendChild(el("p", "muted", "Not checked:"));
+      for (const item of report.coverage.notChecked) receiptPanel.appendChild(el("p", "muted", `— ${item}`));
+      out.insertBefore(receiptPanel, factsPanel);
+    }
+
+    // Data-confidence indicator, with the reasons spelled out.
+    const confPanel = el("div", "panel");
+    confPanel.appendChild(el("h3", null, `Data confidence: ${report.confidence.level.toUpperCase()}`));
+    if (report.confidence.reasons.length) {
+      for (const reason of report.confidence.reasons) {
+        confPanel.appendChild(el("p", "muted", reason));
+      }
+    } else {
+      confPanel.appendChild(el("p", "muted", "Every input to this score was read successfully."));
+    }
+    out.appendChild(confPanel);
+
+    renderReportPanel(report, digest);
+    renderAnchorSection({ mintLabel, result, offline, digest, confidence: report.confidence.level, observedAt: report.observedAt });
+  }
+
+  function renderReportPanel(report, digest) {
+    const panel = el("div", "panel");
+    panel.appendChild(el("h3", null, "Verifiable report"));
+    if (digest) {
+      panel.appendChild(el("p", "muted",
+        "SHA-256 digest of this report's canonical JSON (see README). The same digest is in the memo text below as h=, and anyone can recompute it from the report JSON."));
+      const codeP = el("p");
+      codeP.appendChild(el("code", null, digest));
+      panel.appendChild(codeP);
+      const status = el("p", "muted");
+      const copyBtn = el("button", "secondary", "Copy report JSON");
+      copyBtn.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(JSON.stringify({ ...report, digest }, null, 2));
+          status.textContent = "Report JSON copied. Paste it into the Verify a report section below to check it any time.";
+        } catch {
+          status.textContent = "Clipboard copy failed in this browser context. The digest above still identifies this exact report.";
+        }
+      });
+      panel.appendChild(copyBtn);
+      panel.appendChild(status);
+    } else {
+      panel.appendChild(el("p", "muted",
+        "Digest unavailable: WebCrypto (crypto.subtle) needs a secure context (https or localhost). The report above is unaffected."));
+    }
+    out.appendChild(panel);
+  }
+
+  function renderAnchorSection({ mintLabel, result, offline, digest, confidence, observedAt }) {
+    const panel = el("div", "panel");
+    panel.appendChild(el("h3", null, "Anchor this report on devnet"));
+    const summary = summarize(mintLabel, result);
+    // The memo's ts= is the report's hashed observedAt, not a fresh clock
+    // reading — otherwise the memo would carry a second, unhashed time.
+    const memoText = buildReportMemo(mintLabel, summary, {
+      digest: digest ?? undefined,
+      confidence,
+      timestamp: observedAt,
+    });
+    panel.appendChild(el("p", "muted", "Memo text that gets anchored:"));
+    const code = el("code", null, memoText);
+    const codeP = el("p");
+    codeP.appendChild(code);
+    panel.appendChild(codeP);
+
+    if (offline) {
+      panel.appendChild(el("p", "muted",
+        "Anchoring is disabled for the offline sample because there is no real mint to reference. " +
+        "Score a real mint, then connect a wallet to anchor its report for real."));
+      out.appendChild(panel);
+      return;
+    }
+
+    const wallet = globalThis.solana;
+    if (wallet && typeof wallet.signAndSendTransaction === "function") {
+      panel.appendChild(el("p", "muted",
+        "A wallet is available. This will ask your wallet to sign and send the memo transaction on devnet."));
+      const status = el("p", "muted");
+      const anchorBtn = el("button", null, "Anchor this report on devnet (wallet)");
+      anchorBtn.addEventListener("click", async () => {
+        anchorBtn.disabled = true;
+        status.textContent = "Preparing memo transaction…";
+        try {
+          if (typeof wallet.connect === "function" && !wallet.isConnected) await wallet.connect();
+          const signature = await submitMemoWithWallet({ wallet, memoText, cluster: "devnet" });
+          status.textContent = "";
+          const explorerUrl = explorerUrlForSignature(signature, "devnet");
+          if (explorerUrl) {
+            const link = document.createElement("a");
+            link.href = explorerUrl;
+            link.target = "_blank";
+            link.rel = "noopener";
+            link.textContent = `Anchored on devnet: ${signature}`;
+            status.appendChild(link);
+          } else {
+            status.textContent = `Anchored on devnet: ${signature}`;
+          }
+        } catch (e) {
+          status.textContent =
+            `Wallet anchoring failed: ${e.message}. ` +
+            "The memo text above is unchanged and nothing was broadcast by this page. If the wallet library could not be loaded, check your connection and try again.";
+        } finally {
+          anchorBtn.disabled = false;
+        }
+      });
+      panel.appendChild(anchorBtn);
+      panel.appendChild(status);
+    } else {
+      // No wallet: clearly-marked demo mode. Nothing is broadcast.
+      const demo = anchorReportDemoMode({ mintAddress: mintLabel, summary, digest: digest ?? undefined, confidence, timestamp: observedAt });
+      panel.appendChild(el("p", null, demo.explanation));
+      panel.appendChild(el("p", "muted",
+        "Connect a wallet (for example Phantom, set to devnet) and this section will broadcast the memo for real instead."));
+      const details = el("details");
+      details.appendChild(el("summary", null, "Unsigned transaction (base64) — demo only, not broadcast"));
+      details.appendChild(el("pre", "muted", demo.unsignedTransactionBase64));
+      panel.appendChild(details);
+    }
+    out.appendChild(panel);
+  }
+
+  function describeError(e) {
+    if (e && e.kind === "rate-limited") {
+      return "The public RPC is rate-limiting this demo (HTTP 429, still failing after retries). " +
+        "To fix it: open index.html, search for LAUNCHGUARD_CONFIG (the commented script block just above the module script at the bottom of the file), uncomment it and paste your free Helius endpoint URL over the placeholder (see README: 'How to add your Helius key'). Or wait a minute and retry.";
+    }
+    if (e && e.kind === "unreachable") {
+      return `The RPC endpoint could not be reached. Check your connection and try again. (${e.message})`;
+    }
+    if (e && e.kind === "timeout") {
+      return "The RPC endpoint did not answer in time (10-second limit per call). " +
+        "It may be overloaded or your connection is slow. Wait a moment and retry, or add a free Helius key (see README: 'How to add your Helius key').";
+    }
+    if (e && e.kind === "mint-not-found") {
+      return "No token mint was found at this address on the selected cluster. " +
+        "It may be a wallet address, a non-mint account, or a mint on the other cluster.";
+    }
+    return `Something went wrong: ${e ? e.message : "unknown error"}`;
+  }
+
+  async function scoreFromRpc() {
+    const mint = mintInput.value.trim();
+    const cluster = clusterSelect.value;
+    if (!isValidMintAddress(mint)) {
+      showError("That does not look like a Solana address. Mint addresses are 32-44 base58 characters (no 0, O, I, or l).");
+      return;
+    }
+    goButton.disabled = true;
+    clearOut();
+    out.appendChild(el("p", null, "Reading on-chain facts…"));
+    try {
+      const facts = await fetchMintFacts(mint, cluster);
+      const result = scoreMint(facts);
+      await renderReport({ mintLabel: mint, facts, result, offline: false, cluster });
+    } catch (e) {
+      showError(describeError(e));
+    } finally {
+      goButton.disabled = false;
+    }
+  }
+
+  goButton.addEventListener("click", scoreFromRpc);
+  mintInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") scoreFromRpc();
+  });
+
+  document.getElementById("sample-usdc").addEventListener("click", () => {
+    mintInput.value = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    clusterSelect.value = "mainnet-beta";
+    updateRpcLine();
+    scoreFromRpc();
+  });
+
+  document.getElementById("sample-ruggy").addEventListener("click", () => {
+    // Built-in OFFLINE demo: hardcoded facts scored by the same scoreMint(),
+    // so the HIGH RISK report renders even with no network/RPC at all.
+    const facts = {
+      mintAuthorityActive: true,
+      freezeAuthorityActive: true,
+      topHolderPct: 62,
+      top10HolderPct: 95,
+      holderCount: 12,
+      supplyUi: 1_000_000,
+    };
+    const result = scoreMint(facts);
+    renderReport({ mintLabel: "ruggy-sample (offline demo, not a real mint)", facts, result, offline: true, cluster: clusterSelect.value });
+  });
+
+  // --- Verify a report -------------------------------------------------------
+  // All output goes through textContent; pasted text is never parsed as HTML.
+  const verifyInput = document.getElementById("verify-input");
+  const verifyResult = document.getElementById("verify-result");
+  function showVerify(message, ok) {
+    verifyResult.style.color = ok === true ? "#3ddc84" : ok === false ? "#ff8080" : "";
+    verifyResult.textContent = message;
+  }
+  document.getElementById("verify-btn").addEventListener("click", async () => {
+    const text = verifyInput.value.trim();
+    if (!text) {
+      showVerify("Paste a report JSON or a memo text first.", null);
+      return;
+    }
+    if (text.startsWith("{")) {
+      let obj;
+      try {
+        obj = JSON.parse(text);
+      } catch {
+        showVerify("That looks like JSON but does not parse. Paste the full report JSON.", false);
+        return;
+      }
+      try {
+        const v = await verifyReport(obj);
+        if (v.ok) {
+          showVerify(`MATCH — the recomputed digest equals the report's stored digest (${v.computedDigest}). This report is intact.`, true);
+        } else if (v.storedDigest) {
+          showVerify(`MISMATCH — stored digest ${v.storedDigest} does not match the recomputed digest ${v.computedDigest}. The report was changed after it was digested.`, false);
+        } else {
+          showVerify("MISMATCH — this report JSON has no digest field, so there is nothing to verify it against.", false);
+        }
+      } catch (e) {
+        showVerify(`Could not verify: ${e.message}`, false);
+      }
+      return;
+    }
+    const h = parseMemoDigest(text);
+    if (!h) {
+      showVerify("No h=<digest> field found in that text. Paste a full report JSON, or a memo that carries a digest.", false);
+      return;
+    }
+    if (!currentDigest) {
+      showVerify(`That memo carries digest ${h}, but no report is currently displayed to compare it with. Score a mint first, or paste the report JSON instead.`, null);
+      return;
+    }
+    if (h === currentDigest) {
+      // The digest matches, but the memo's plain mint=/score=/band= fields
+      // are NOT covered by that digest — cross-check them against the
+      // displayed report before calling this a match.
+      const mismatches = compareMemoFieldsToReport(parseMemoFields(text), currentReport);
+      if (mismatches.length) {
+        showVerify(
+          `FIELD MISMATCH — the memo's digest matches the displayed report, but its fields disagree: ${mismatches.join("; ")}. ` +
+          "Do not treat this memo as anchoring the displayed report.",
+          false,
+        );
+      } else if (currentReportOffline) {
+        showVerify(
+          `MATCH — the memo's digest equals the currently displayed report's digest (${h}). ` +
+          "Note: that report is the offline sample report (built-in demo data, not a real mint).",
+          true,
+        );
+      } else {
+        showVerify(`MATCH — the memo's digest equals the currently displayed report's digest (${h}), and its mint/score/band fields agree with that report.`, true);
+      }
+    } else {
+      showVerify(`MISMATCH — the memo's digest ${h} does not match the currently displayed report's digest ${currentDigest}.`, false);
+    }
+  });
+</script>
+</body>
+</html>
