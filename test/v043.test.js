@@ -325,5 +325,5 @@ test("v0.4.3 errors: the anchor catch shows the specific web3-load-failed text, 
 
 test("v0.4.3 version: package.json is 0.4.3", () => {
   const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
-  assert.equal(pkg.version, "0.4.3");
+  assert.equal(pkg.version, "0.4.6");
 });
