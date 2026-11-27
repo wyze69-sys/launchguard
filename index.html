@@ -9,8 +9,14 @@
      override. connect-src allows arbitrary https RPC endpoints plus
      localhost http for local dev endpoints. style-src keeps the inline
      <style> block working. Hashes must be recomputed if either inline
-     script changes. -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' https://unpkg.com 'sha256-lNgU3lPhtY+e637QJLfZvRpPY2ec36bIJfEfjuZYE2c=' 'sha256-uIwrrlYnkNrrEqqbCiOWEJ2NaIAeelnVGV2VbGN+StM='; style-src 'unsafe-inline'; img-src data:; object-src 'none'; base-uri 'none'; connect-src https: http://localhost:* http://127.0.0.1:*">
+     script changes.
+     v0.4.2: script-src also allows the chrome-extension: and
+     moz-extension: schemes so a wallet extension (e.g. Phantom) can
+     inject its provider script into this page. Without them the
+     injected provider never runs, window.solana / window.phantom stay
+     undefined, and the anchor panel falls back to DEMO MODE even with
+     a wallet installed. No 'unsafe-inline', no wildcard hosts. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' https://unpkg.com chrome-extension: moz-extension: 'sha256-lNgU3lPhtY+e637QJLfZvRpPY2ec36bIJfEfjuZYE2c=' 'sha256-x7s+uffsLp+3dvHS78kKL4OOCdIZolZ5qJ82nUQu1Jg='; style-src 'unsafe-inline'; img-src data:; object-src 'none'; base-uri 'none'; connect-src https: http://localhost:* http://127.0.0.1:*">
 <title>LaunchGuard — Solana token risk reports you can verify</title>
 <style>
   :root {
@@ -677,10 +683,143 @@
 <script type="module">
   import { fetchMintFacts } from "./src/lib/solana.js";
   import { scoreMint, summarize } from "./src/lib/risk.js";
-  import { buildReportMemo, anchorReportDemoMode, submitMemoWithWallet, explorerUrlForSignature } from "./src/lib/memo.js";
+  import { buildReportMemo, anchorReportDemoMode, submitMemoWithWallet, explorerUrlForSignature, base58Encode } from "./src/lib/memo.js";
   import { buildReport, digestReport, verifyReport, parseMemoDigest, parseMemoFields, compareMemoFieldsToReport } from "./src/lib/report.js";
   import { getRpcEndpointHost } from "./src/lib/config.js";
   window.__lgModuleLoaded = true;
+
+  // ==== LG WALLET DISCOVERY BEGIN (v0.4.2) ====
+  // Wallet discovery, three layers, in priority order:
+  //   1. window.solana — the legacy injected provider (behaviour
+  //      unchanged from v0.4.1 when it is present).
+  //   2. window.phantom.solana — namespaced-only providers (a wallet
+  //      that exposes itself ONLY under window.phantom) were invisible
+  //      to the v0.4.1 lookup, which read window.solana alone.
+  //   3. Wallet Standard — wallets that register through the
+  //      wallet-standard:app-ready / wallet-standard:register-wallet
+  //      handshake are adapted to the same provider shape the anchor
+  //      code below already uses (publicKey / connect /
+  //      signAndSendTransaction), so the anchor flow is unchanged.
+  // This block is deliberately self-contained — it uses only the
+  // base58Encode import above and language builtins — so the test
+  // suite can extract it verbatim from this file (between the BEGIN /
+  // END markers) and exercise the real shipped code, not a copy.
+  function lgIsWalletProvider(candidate) {
+    return Boolean(candidate) && typeof candidate.signAndSendTransaction === "function";
+  }
+
+  function lgStandardAccountAddress(account) {
+    if (!account) return null;
+    if (typeof account.address === "string" && account.address) return account.address;
+    if (account.publicKey instanceof Uint8Array) return base58Encode(account.publicKey);
+    return null;
+  }
+
+  // Adapt a Wallet Standard wallet (one offering the
+  // solana:signAndSendTransaction feature) to the legacy provider
+  // shape. Returns null when the wallet does not offer that feature.
+  function lgAdaptStandardWallet(stdWallet) {
+    const feature = stdWallet && stdWallet.features ? stdWallet.features["solana:signAndSendTransaction"] : null;
+    if (!feature || typeof feature.signAndSendTransaction !== "function") return null;
+    let currentAccount = Array.isArray(stdWallet.accounts) && stdWallet.accounts.length ? stdWallet.accounts[0] : null;
+    const provider = {
+      isWalletStandard: true,
+      get publicKey() {
+        const address = lgStandardAccountAddress(currentAccount);
+        if (!address) return null;
+        return { toBase58: () => address, toString: () => address };
+      },
+      get isConnected() { return currentAccount !== null; },
+      async connect() {
+        const connectFeature = stdWallet.features["standard:connect"];
+        if (connectFeature && typeof connectFeature.connect === "function") {
+          const result = await connectFeature.connect();
+          const fromResult = result && Array.isArray(result.accounts) && result.accounts.length ? result.accounts : null;
+          const fromWallet = Array.isArray(stdWallet.accounts) && stdWallet.accounts.length ? stdWallet.accounts : null;
+          if (fromResult) currentAccount = fromResult[0];
+          else if (fromWallet) currentAccount = fromWallet[0];
+        } else if (!currentAccount && Array.isArray(stdWallet.accounts) && stdWallet.accounts.length) {
+          currentAccount = stdWallet.accounts[0];
+        }
+        if (!currentAccount) throw new Error("Wallet connected but exposed no account");
+        return { publicKey: provider.publicKey };
+      },
+      async signAndSendTransaction(transaction) {
+        if (!currentAccount) await provider.connect();
+        // The existing anchor flow hands over a web3.js Transaction
+        // object (or, when web3.js could not be loaded, raw serialized
+        // bytes). The Wallet Standard feature takes serialized bytes
+        // inside an input object, so serialize here at the boundary;
+        // the account and chain travel with the input, per the
+        // standard's feature shape.
+        let txBytes;
+        if (transaction instanceof Uint8Array) {
+          txBytes = transaction;
+        } else if (transaction && typeof transaction.serialize === "function") {
+          try {
+            txBytes = transaction.serialize({ requireAllSignatures: false, verifySignatures: false });
+          } catch {
+            txBytes = transaction.serialize();
+          }
+        } else {
+          throw new Error("Wallet Standard adapter: unsupported transaction shape");
+        }
+        const outputs = await feature.signAndSendTransaction({
+          account: currentAccount,
+          transaction: txBytes,
+          chain: "solana:devnet",
+        });
+        const first = Array.isArray(outputs) ? outputs[0] : outputs;
+        const signature = first && typeof first === "object" ? first.signature : first;
+        if (typeof signature === "string") return signature;
+        if (signature instanceof Uint8Array) return base58Encode(signature);
+        throw new Error("Wallet did not return a transaction signature");
+      },
+    };
+    return provider;
+  }
+
+  // Discovery registry + the Wallet Standard handshake on a
+  // window-like root. start() announces this app and listens for
+  // wallets announcing themselves; findProvider() is read at
+  // anchor-render time, so a wallet that registers late is still seen.
+  function lgCreateWalletDiscovery(root) {
+    const adapted = [];
+    const seen = new Set();
+    const api = {
+      register(...wallets) {
+        for (const w of wallets) {
+          if (!w || seen.has(w)) continue;
+          seen.add(w);
+          const provider = lgAdaptStandardWallet(w);
+          if (provider) adapted.push(provider);
+        }
+      },
+    };
+    return {
+      start() {
+        if (!root || typeof root.addEventListener !== "function" || typeof root.dispatchEvent !== "function") return;
+        root.addEventListener("wallet-standard:register-wallet", (event) => {
+          // The event detail is a callback the wallet expects the app
+          // to invoke with its API object.
+          try { if (event && typeof event.detail === "function") event.detail(api); } catch { /* a broken wallet must not break the page */ }
+        });
+        try {
+          root.dispatchEvent(new CustomEvent("wallet-standard:app-ready", { detail: api }));
+        } catch { /* handshake unavailable in this context; the legacy layers still apply */ }
+      },
+      findProvider() {
+        if (lgIsWalletProvider(root && root.solana)) return root.solana;
+        const namespaced = root && root.phantom ? root.phantom.solana : null;
+        if (lgIsWalletProvider(namespaced)) return namespaced;
+        return adapted.length ? adapted[0] : null;
+      },
+    };
+  }
+  // ==== LG WALLET DISCOVERY END ====
+
+  const lgWalletDiscovery = lgCreateWalletDiscovery(globalThis);
+  lgWalletDiscovery.start();
 
   // The currently displayed report and its digest, for the verifier below.
   // Cleared on every error path (see clearCurrentReport) so the verifier
@@ -947,7 +1086,7 @@
       return;
     }
 
-    const wallet = globalThis.solana;
+    const wallet = lgWalletDiscovery.findProvider();
     if (wallet && typeof wallet.signAndSendTransaction === "function") {
       panel.appendChild(el("p", "muted",
         "A wallet is available. This will ask your wallet to sign and send the memo transaction on devnet."));
