@@ -431,6 +431,12 @@ function walletPublicKeyBase58(wallet) {
 /** Pinned @solana/web3.js build used ONLY for the wallet path (LG-B7). */
 export const WEB3_JS_VERSION = "1.98.4";
 export const WEB3_JS_CDN_URL = `https://unpkg.com/@solana/web3.js@${WEB3_JS_VERSION}/dist/index.iife.min.js`;
+/** Pinned jsdelivr mirror of the SAME web3.js version (v0.4.3): the
+ *  legacy-wallet path needs a real Transaction object, so the loader
+ *  falls back to this mirror when the primary CDN cannot be reached. */
+export const WEB3_JS_CDN_URL_JSDELIVR = `https://cdn.jsdelivr.net/npm/@solana/web3.js@${WEB3_JS_VERSION}/dist/index.iife.min.js`;
+/** Ordered loader attempt list: primary first, mirror second. */
+export const WEB3_JS_CDN_URLS = [WEB3_JS_CDN_URL, WEB3_JS_CDN_URL_JSDELIVR];
 
 /**
  * Build a real web3.js Transaction for the memo, from exactly the same
@@ -466,23 +472,38 @@ export function buildMemoTransactionObject({ feePayer, recentBlockhash, memoText
 /**
  * Lazy-load the pinned web3.js build (browser only). Resolves to the
  * `solanaWeb3` global, or null when loading is impossible (Node, no
- * document, blocked CDN, offline) — callers then use the raw-bytes
- * fallback path. Never called on page load or in demo mode.
+ * document, blocked CDNs, offline). Attempt order (v0.4.3): the pinned
+ * unpkg URL, then the pinned jsdelivr mirror of the same version, then
+ * one retry of the whole sequence; null is resolved only after every
+ * attempt has failed. Never called on page load or in demo mode, and
+ * never called at all for Wallet Standard providers (their path is
+ * bytes-native). The { url, urls, globalObject } parameters are the
+ * test-injection surface: a single `url` narrows the sequence to that
+ * one URL; `urls` replaces the sequence outright.
  */
-export async function loadSolanaWeb3({ url = WEB3_JS_CDN_URL, globalObject = globalThis } = {}) {
+export async function loadSolanaWeb3({ url, urls, globalObject = globalThis } = {}) {
   if (globalObject.solanaWeb3) return globalObject.solanaWeb3;
   if (typeof document === "undefined" || typeof document.createElement !== "function") return null;
-  try {
-    await new Promise((resolve, reject) => {
+  const sequence = Array.isArray(urls) && urls.length ? [...urls] : url ? [url] : [...WEB3_JS_CDN_URLS];
+  const loadOne = (candidate) =>
+    new Promise((resolve, reject) => {
       const script = document.createElement("script");
-      script.src = url;
+      script.src = candidate;
       script.async = true;
       script.onload = () => resolve();
       script.onerror = () => reject(new Error("web3.js failed to load"));
       (document.head || document.body || document.documentElement).appendChild(script);
     });
-  } catch {
-    return null;
+  // Two passes over the sequence (initial attempt + one retry).
+  for (let pass = 0; pass < 2; pass++) {
+    for (const candidate of sequence) {
+      try {
+        await loadOne(candidate);
+      } catch {
+        continue; // try the next mirror, then the retry pass
+      }
+      if (globalObject.solanaWeb3) return globalObject.solanaWeb3;
+    }
   }
   return globalObject.solanaWeb3 ?? null;
 }
@@ -501,13 +522,20 @@ function isRetryableSubmissionError(err) {
 /**
  * Browser path: anchor a memo via a connected wallet.
  *
- * Fetches the latest blockhash, then submits through the wallet. When a
- * web3.js namespace is available (injected, already loaded, or lazily
- * loaded from the pinned CDN build), a real Transaction object is built
- * and passed to `signAndSendTransaction` — the shape Phantom and
- * wallet-adapter wallets actually accept (LG-B7). When web3.js cannot
- * be loaded, the existing hand-rolled serialized bytes are passed as a
- * fallback for providers that accept them.
+ * Fetches the latest blockhash, then submits through the wallet. The
+ * shape handed to the wallet is routed by provider kind (v0.4.3):
+ *   - Wallet Standard adapter (`wallet.isWalletStandard === true`):
+ *     the hand-rolled serialized BYTES are passed — the Wallet
+ *     Standard feature is bytes-native — and web3.js is never loaded
+ *     on this path.
+ *   - Legacy provider (anything else): ONLY a real web3.js Transaction
+ *     object may be passed (LG-B7) — Phantom's legacy
+ *     `signAndSendTransaction` calls `transaction.serialize()` and
+ *     throws "t.serialize is not a function" on raw bytes. web3.js is
+ *     taken from the injected namespace or lazily loaded from the
+ *     pinned CDN builds; if it still cannot be loaded, a typed error
+ *     (`err.kind === "web3-load-failed"`) is thrown and the wallet is
+ *     NEVER invoked.
  *
  * Retry policy (LG-F12): a submission is retried ONCE with a fresh
  * blockhash only for blockhash/expiry-class errors. A user rejection is
@@ -525,12 +553,26 @@ export async function submitMemoWithWallet({ wallet, memoText, cluster = "devnet
   const endpoint = getRpcEndpoint(cluster);
   const feePayer = walletPublicKeyBase58(wallet);
 
-  let web3ns = web3 ?? globalThis.solanaWeb3 ?? null;
-  if (!web3ns) {
-    try {
-      web3ns = loadWeb3 ? await loadWeb3() : await loadSolanaWeb3();
-    } catch {
-      web3ns = null;
+  // Shape routing (v0.4.3): Wallet Standard providers are bytes-native
+  // and must not trigger a web3.js load at all. Legacy providers get a
+  // real Transaction object or a typed failure — never raw bytes.
+  const isWalletStandard = wallet.isWalletStandard === true;
+  let web3ns = null;
+  if (!isWalletStandard) {
+    web3ns = web3 ?? globalThis.solanaWeb3 ?? null;
+    if (!web3ns) {
+      try {
+        web3ns = loadWeb3 ? await loadWeb3() : await loadSolanaWeb3();
+      } catch {
+        web3ns = null;
+      }
+    }
+    if (!web3ns) {
+      const err = new Error(
+        "The wallet library (web3.js) could not be loaded, so the transaction could not be prepared for your wallet.",
+      );
+      err.kind = "web3-load-failed";
+      throw err;
     }
   }
 
@@ -543,12 +585,12 @@ export async function submitMemoWithWallet({ wallet, memoText, cluster = "devnet
 
   const attemptOnce = async () => {
     const recentBlockhash = await fetchBlockhash();
-    if (web3ns) {
-      const txObject = buildMemoTransactionObject({ feePayer, recentBlockhash, memoText, web3: web3ns });
-      return wallet.signAndSendTransaction(txObject);
+    if (isWalletStandard) {
+      const txBytes = buildMemoTransaction({ feePayer, recentBlockhash, memoText });
+      return wallet.signAndSendTransaction(txBytes);
     }
-    const txBytes = buildMemoTransaction({ feePayer, recentBlockhash, memoText });
-    return wallet.signAndSendTransaction(txBytes);
+    const txObject = buildMemoTransactionObject({ feePayer, recentBlockhash, memoText, web3: web3ns });
+    return wallet.signAndSendTransaction(txObject);
   };
 
   let result;
