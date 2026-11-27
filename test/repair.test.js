@@ -583,13 +583,58 @@ test("LG-B7: submitMemoWithWallet passes a Transaction object (not bytes) when w
   } finally { restore(); }
 });
 
-test("LG-B7: raw-bytes fallback is used when web3 cannot load, byte-identical to the hand-rolled builder", async () => {
+test("LG-B7 (v0.4.3 correction): legacy wallet + web3 cannot load => typed web3-load-failed error and the wallet is NEVER invoked", async () => {
+  // CORRECTED TEST (charter section 4, disclosed in the v0.4.3
+  // checkpoint): the previous version of this test asserted that raw
+  // serialized bytes are passed to a legacy-shaped wallet when web3
+  // cannot load. That behaviour is the live defect: real Phantom's
+  // legacy signAndSendTransaction throws "t.serialize is not a
+  // function" on bytes. The stronger replacement asserts the typed
+  // failure and that the wallet is never called at all.
+  const { restore } = blockhashFetch();
+  let calls = 0;
+  const wallet = { publicKey: MINT, signAndSendTransaction: async () => { calls += 1; return { signature: SIG }; } };
+  const hadGlobal = Object.prototype.hasOwnProperty.call(globalThis, "solanaWeb3");
+  const savedGlobal = globalThis.solanaWeb3;
+  delete globalThis.solanaWeb3;
+  try {
+    await assert.rejects(
+      () => submitMemoWithWallet({ wallet, memoText: "LG1|mint=x", cluster: "devnet", loadWeb3: async () => null }),
+      (err) => {
+        assert.equal(err.kind, "web3-load-failed");
+        assert.match(err.message, /wallet library \(web3\.js\) could not be loaded/i);
+        return true;
+      },
+    );
+    assert.equal(calls, 0, "the wallet must never be invoked when web3.js cannot load for a legacy provider");
+  } finally {
+    restore();
+    if (hadGlobal) globalThis.solanaWeb3 = savedGlobal; else delete globalThis.solanaWeb3;
+  }
+});
+
+test("LG-B7 (v0.4.3 correction): Wallet Standard wallet + web3 unavailable => succeeds with bytes byte-identical to the hand-rolled builder, loader never consulted", async () => {
+  // Second half of the corrected pair: the byte-identity assertion of
+  // the old test is preserved, but at the boundary where bytes are
+  // legitimate — a Wallet Standard provider (isWalletStandard), whose
+  // feature is bytes-native. web3.js must not even be consulted.
   const { restore } = blockhashFetch();
   let received = null;
-  const wallet = { publicKey: MINT, signAndSendTransaction: async (arg) => { received = arg; return { signature: SIG }; } };
+  let loadCalls = 0;
+  const wallet = {
+    isWalletStandard: true,
+    publicKey: MINT,
+    signAndSendTransaction: async (arg) => { received = arg; return { signature: SIG }; },
+  };
   try {
-    const sig = await submitMemoWithWallet({ wallet, memoText: "LG1|mint=x", cluster: "devnet", loadWeb3: async () => null });
+    const sig = await submitMemoWithWallet({
+      wallet,
+      memoText: "LG1|mint=x",
+      cluster: "devnet",
+      loadWeb3: async () => { loadCalls += 1; return null; },
+    });
     assert.equal(sig, SIG);
+    assert.equal(loadCalls, 0, "the web3 loader must never be consulted on the Wallet Standard path");
     assert.ok(received instanceof Uint8Array);
     const expected = buildMemoTransaction({ feePayer: MINT, recentBlockhash: BLOCKHASH, memoText: "LG1|mint=x" });
     assert.deepEqual([...received], [...expected]);
