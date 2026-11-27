@@ -15,8 +15,12 @@
      inject its provider script into this page. Without them the
      injected provider never runs, window.solana / window.phantom stay
      undefined, and the anchor panel falls back to DEMO MODE even with
-     a wallet installed. No 'unsafe-inline', no wildcard hosts. -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' https://unpkg.com chrome-extension: moz-extension: 'sha256-lNgU3lPhtY+e637QJLfZvRpPY2ec36bIJfEfjuZYE2c=' 'sha256-x7s+uffsLp+3dvHS78kKL4OOCdIZolZ5qJ82nUQu1Jg='; style-src 'unsafe-inline'; img-src data:; object-src 'none'; base-uri 'none'; connect-src https: http://localhost:* http://127.0.0.1:*">
+     a wallet installed. No 'unsafe-inline', no wildcard hosts.
+     v0.4.3: script-src also allows the exact host
+     https://cdn.jsdelivr.net, the pinned mirror the web3.js loader
+     falls back to when unpkg cannot be reached (same pinned version,
+     exact host only — no wildcards). -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' https://unpkg.com https://cdn.jsdelivr.net chrome-extension: moz-extension: 'sha256-lNgU3lPhtY+e637QJLfZvRpPY2ec36bIJfEfjuZYE2c=' 'sha256-Jj23WdkuvQPqPXNPkXuaC4Dkozk8WsNskE+seZ7O0nM='; style-src 'unsafe-inline'; img-src data:; object-src 'none'; base-uri 'none'; connect-src https: http://localhost:* http://127.0.0.1:*">
 <title>LaunchGuard — Solana token risk reports you can verify</title>
 <style>
   :root {
@@ -689,17 +693,21 @@
   window.__lgModuleLoaded = true;
 
   // ==== LG WALLET DISCOVERY BEGIN (v0.4.2) ====
-  // Wallet discovery, three layers, in priority order:
-  //   1. window.solana — the legacy injected provider (behaviour
-  //      unchanged from v0.4.1 when it is present).
-  //   2. window.phantom.solana — namespaced-only providers (a wallet
-  //      that exposes itself ONLY under window.phantom) were invisible
-  //      to the v0.4.1 lookup, which read window.solana alone.
-  //   3. Wallet Standard — wallets that register through the
+  // Wallet discovery, three layers, in priority order (v0.4.3):
+  //   1. Wallet Standard — wallets that register through the
   //      wallet-standard:app-ready / wallet-standard:register-wallet
   //      handshake are adapted to the same provider shape the anchor
   //      code below already uses (publicKey / connect /
-  //      signAndSendTransaction), so the anchor flow is unchanged.
+  //      signAndSendTransaction). This layer is FIRST because the
+  //      Wallet Standard path is bytes-native: it never needs the
+  //      web3.js CDN build, so the common case (Phantom registers
+  //      via Wallet Standard) no longer depends on a CDN at all.
+  //   2. window.solana — the legacy injected provider (behaviour
+  //      unchanged from v0.4.1 when it is present). Legacy providers
+  //      are only ever handed a real web3.js Transaction object.
+  //   3. window.phantom.solana — namespaced-only providers (a wallet
+  //      that exposes itself ONLY under window.phantom) were invisible
+  //      to the v0.4.1 lookup, which read window.solana alone.
   // This block is deliberately self-contained — it uses only the
   // base58Encode import above and language builtins — so the test
   // suite can extract it verbatim from this file (between the BEGIN /
@@ -746,12 +754,13 @@
       },
       async signAndSendTransaction(transaction) {
         if (!currentAccount) await provider.connect();
-        // The existing anchor flow hands over a web3.js Transaction
-        // object (or, when web3.js could not be loaded, raw serialized
-        // bytes). The Wallet Standard feature takes serialized bytes
-        // inside an input object, so serialize here at the boundary;
-        // the account and chain travel with the input, per the
-        // standard's feature shape.
+        // The anchor flow hands this adapter the hand-rolled
+        // serialized bytes directly (the Wallet Standard path never
+        // loads web3.js); a web3.js Transaction object is also
+        // accepted and serialized here at the boundary. The Wallet
+        // Standard feature takes serialized bytes inside an input
+        // object; the account and chain travel with the input, per
+        // the standard's feature shape.
         let txBytes;
         if (transaction instanceof Uint8Array) {
           txBytes = transaction;
@@ -809,10 +818,11 @@
         } catch { /* handshake unavailable in this context; the legacy layers still apply */ }
       },
       findProvider() {
+        if (adapted.length) return adapted[0];
         if (lgIsWalletProvider(root && root.solana)) return root.solana;
         const namespaced = root && root.phantom ? root.phantom.solana : null;
         if (lgIsWalletProvider(namespaced)) return namespaced;
-        return adapted.length ? adapted[0] : null;
+        return null;
       },
     };
   }
@@ -1111,9 +1121,15 @@
             status.textContent = `Anchored on devnet: ${signature}`;
           }
         } catch (e) {
-          status.textContent =
-            `Wallet anchoring failed: ${e.message}. ` +
-            "The memo text above is unchanged and nothing was broadcast by this page. If the wallet library could not be loaded, check your connection and try again.";
+          if (e && e.kind === "web3-load-failed") {
+            status.textContent =
+              "The wallet library (web3.js) could not be loaded, so nothing was sent to your wallet. " +
+              "Check your connection and try again. The memo text above is unchanged and nothing was broadcast by this page.";
+          } else {
+            status.textContent =
+              `Wallet anchoring failed: ${e.message}. ` +
+              "The memo text above is unchanged and nothing was broadcast by this page. If the wallet library could not be loaded, check your connection and try again.";
+          }
         } finally {
           anchorBtn.disabled = false;
         }
